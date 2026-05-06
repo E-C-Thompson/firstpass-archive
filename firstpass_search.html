@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FirstPass — Letter Search</title>
+
+<!-- Transformers.js — runs the embedding model entirely in the browser -->
+<script type="module">
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIGURATION — update these two values for each collection
+// ─────────────────────────────────────────────────────────────────────────────
+const INDEX_URL     = "beckerman_search_index.json"; // path to your JSON index file
+const COLLECTION    = "Beckerman";                   // display name
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js";
+
+// Use CDN for model files — no local download needed on the website
+env.allowLocalModels = false;
+
+let extractor    = null;  // the embedding model
+let indexData    = null;  // the pre-computed letter embeddings
+let modelReady   = false;
+
+const statusEl   = document.getElementById("status");
+const inputEl    = document.getElementById("query");
+const btnEl      = document.getElementById("search-btn");
+const resultsEl  = document.getElementById("results");
+const countEl    = document.getElementById("result-count");
+const topKEl     = document.getElementById("top-k");
+
+// ── Cosine similarity between two vectors ────────────────────────────────────
+function cosineSim(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na  += a[i] * a[i];
+    nb  += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+// ── Load model and index on page load ────────────────────────────────────────
+async function init() {
+  setStatus("loading-model", "Loading search model…");
+
+  try {
+    // Load the embedding model (downloads ~23MB on first visit, cached after)
+    extractor = await pipeline(
+      "feature-extraction",
+      "Xenova/all-MiniLM-L6-v2",
+      { progress_callback: (p) => {
+          if (p.status === "progress") {
+            const pct = Math.round(p.progress || 0);
+            setStatus("loading-model", `Loading model… ${pct}%`);
+          }
+        }
+      }
+    );
+  } catch (e) {
+    setStatus("error", "Could not load search model. Check your connection.");
+    return;
+  }
+
+  setStatus("loading-index", "Loading letter index…");
+
+  try {
+    const resp = await fetch(INDEX_URL);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    indexData = await resp.json();
+    document.getElementById("collection-name").textContent = indexData.collection || COLLECTION;
+    document.getElementById("letter-count").textContent = `${indexData.item_count} letters`;
+  } catch (e) {
+    setStatus("error", `Could not load letter index (${INDEX_URL}). Check the file is uploaded.`);
+    return;
+  }
+
+  modelReady = true;
+  setStatus("ready", `Ready — ${indexData.item_count} letters indexed`);
+  btnEl.disabled = false;
+  inputEl.disabled = false;
+  inputEl.placeholder = "e.g. loneliness and missing home, or fear of combat, or family news…";
+  inputEl.focus();
+}
+
+// ── Run a search ─────────────────────────────────────────────────────────────
+async function search() {
+  const query = inputEl.value.trim();
+  if (!query || !modelReady) return;
+
+  btnEl.disabled = true;
+  setStatus("searching", "Searching…");
+  resultsEl.innerHTML = "";
+  countEl.textContent = "";
+
+  // Embed the query
+  let queryEmbedding;
+  try {
+    const output = await extractor(query, { pooling: "mean", normalize: true });
+    queryEmbedding = Array.from(output.data);
+  } catch (e) {
+    setStatus("error", "Search failed. Please try again.");
+    btnEl.disabled = false;
+    return;
+  }
+
+  // Score every letter
+  const topK = parseInt(topKEl.value) || 10;
+  const scored = indexData.items.map(item => ({
+    item,
+    score: cosineSim(queryEmbedding, item.embedding)
+  }));
+
+  // Sort by score descending
+  scored.sort((a, b) => b.score - a.score);
+  const topResults = scored.slice(0, topK);
+
+  // Render results
+  renderResults(topResults, query, topK);
+  setStatus("ready", `Ready — ${indexData.item_count} letters indexed`);
+  btnEl.disabled = false;
+}
+
+// ── Render results ────────────────────────────────────────────────────────────
+function renderResults(results, query, topK) {
+  if (!results.length) {
+    countEl.textContent = "No results found.";
+    return;
+  }
+
+  const highThreshold = 0.55;
+  const medThreshold  = 0.40;
+
+  countEl.textContent = `Top ${results.length} most relevant letters for "${query}"`;
+
+  const cards = results.map((r, idx) => {
+    const { item, score } = r;
+    const pct = Math.round(score * 100);
+    const relevance = score >= highThreshold ? "high" : score >= medThreshold ? "medium" : "low";
+    const relevanceLabel = { high: "Strong match", medium: "Possible match", low: "Weak match" }[relevance];
+
+    const viewerBtn = item.viewer_link
+      ? `<a class="viewer-link" href="${item.viewer_link}" target="_blank">Open in viewer →</a>`
+      : "";
+
+    const meta = [
+      item.sender    ? `<span class="meta-item"><span class="meta-label">From</span> ${item.sender}${item.sender_location ? `, ${item.sender_location}` : ""}</span>` : "",
+      item.recipient ? `<span class="meta-item"><span class="meta-label">To</span> ${item.recipient}</span>` : "",
+      item.date      ? `<span class="meta-item"><span class="meta-label">Date</span> ${item.date}</span>` : "",
+      item.page_count > 1 ? `<span class="meta-item">${item.page_count} pages</span>` : "",
+    ].filter(Boolean).join("");
+
+    const topics = item.topics
+      ? item.topics.split(",").slice(0, 5).map(t =>
+          `<span class="topic-tag">${t.trim()}</span>`).join("")
+      : "";
+
+    return `
+      <div class="result-card ${relevance}" style="animation-delay: ${idx * 0.05}s">
+        <div class="card-header">
+          <div class="card-id">${item.id}</div>
+          <div class="relevance-badge ${relevance}">
+            <span class="score-bar"><span style="width:${pct}%"></span></span>
+            ${relevanceLabel} &nbsp; ${pct}%
+          </div>
+        </div>
+        <div class="card-meta">${meta}</div>
+        <p class="card-summary">${item.summary || "No summary available."}</p>
+        ${topics ? `<div class="card-topics">${topics}</div>` : ""}
+        <div class="card-footer">${viewerBtn}</div>
+      </div>`;
+  }).join("");
+
+  resultsEl.innerHTML = cards;
+}
+
+// ── Status helper ─────────────────────────────────────────────────────────────
+function setStatus(type, msg) {
+  statusEl.className = `status ${type}`;
+  statusEl.textContent = msg;
+}
+
+// ── Event listeners ───────────────────────────────────────────────────────────
+btnEl.addEventListener("click", search);
+inputEl.addEventListener("keydown", e => { if (e.key === "Enter") search(); });
+
+init();
+</script>
+
+<style>
+:root {
+  --navy:   #1a2e4a;
+  --blue:   #2b5a8a;
+  --gold:   #c8903a;
+  --cream:  #f7f3ed;
+  --paper:  #faf7f2;
+  --ink:    #2c2416;
+  --mid:    #6b5c48;
+  --border: #ddd5c8;
+  --high:   #2d6a2d;
+  --medium: #7a5c00;
+  --low:    #888;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: Georgia, "Times New Roman", serif;
+  background: var(--cream);
+  color: var(--ink);
+  min-height: 100vh;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+.site-header {
+  background: var(--navy);
+  padding: 32px 40px 28px;
+  border-bottom: 3px solid var(--gold);
+}
+.header-inner { max-width: 900px; margin: 0 auto; }
+.site-title {
+  font-family: "Palatino Linotype", Palatino, Georgia, serif;
+  font-size: 28px;
+  font-weight: normal;
+  color: #fff;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.site-title span { color: var(--gold); }
+.site-subtitle {
+  font-size: 14px;
+  color: #a0b4c8;
+  font-style: italic;
+}
+
+/* ── Search box ──────────────────────────────────────────────────────────── */
+.search-section {
+  max-width: 900px;
+  margin: 36px auto 0;
+  padding: 0 40px;
+}
+.search-label {
+  display: block;
+  font-size: 13px;
+  font-weight: bold;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--blue);
+  margin-bottom: 10px;
+}
+.search-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+#query {
+  flex: 1;
+  padding: 14px 18px;
+  font-size: 16px;
+  font-family: Georgia, serif;
+  border: 2px solid var(--border);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  outline: none;
+  transition: border-color 0.2s;
+}
+#query:focus { border-color: var(--blue); }
+#query:disabled { opacity: 0.5; cursor: not-allowed; }
+
+#search-btn {
+  padding: 14px 28px;
+  background: var(--navy);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 15px;
+  font-family: Georgia, serif;
+  cursor: pointer;
+  transition: background 0.2s;
+  white-space: nowrap;
+}
+#search-btn:hover:not(:disabled) { background: var(--blue); }
+#search-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.search-controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 13px;
+  color: var(--mid);
+}
+.search-controls label { display: flex; align-items: center; gap: 6px; }
+#top-k {
+  width: 60px; padding: 4px 8px;
+  border: 1px solid var(--border); border-radius: 3px;
+  font-size: 13px; font-family: Georgia, serif;
+  background: var(--paper); color: var(--ink);
+}
+
+/* ── Status bar ──────────────────────────────────────────────────────────── */
+.status {
+  max-width: 900px; margin: 16px auto 0; padding: 0 40px;
+  font-size: 13px; color: var(--mid); font-style: italic;
+  min-height: 20px;
+}
+.status.ready    { color: #2d6a2d; font-style: normal; }
+.status.error    { color: #b33; font-style: normal; font-weight: bold; }
+.status.searching { color: var(--blue); }
+
+/* ── Hint text ───────────────────────────────────────────────────────────── */
+.hints {
+  max-width: 900px; margin: 20px auto 0; padding: 0 40px;
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.hint-chip {
+  background: var(--paper);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 5px 14px;
+  font-size: 12px;
+  color: var(--mid);
+  cursor: pointer;
+  transition: all 0.15s;
+  font-style: italic;
+}
+.hint-chip:hover { background: var(--navy); color: #fff; border-color: var(--navy); }
+
+/* ── Results ─────────────────────────────────────────────────────────────── */
+.results-section { max-width: 900px; margin: 28px auto 60px; padding: 0 40px; }
+#result-count {
+  font-size: 13px; color: var(--mid);
+  margin-bottom: 20px; font-style: italic;
+}
+
+.result-card {
+  background: var(--paper);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border);
+  border-radius: 4px;
+  padding: 20px 24px;
+  margin-bottom: 16px;
+  animation: slideIn 0.3s ease both;
+}
+.result-card.high   { border-left-color: var(--high); }
+.result-card.medium { border-left-color: var(--gold); }
+.result-card.low    { border-left-color: #bbb; }
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.card-header {
+  display: flex; justify-content: space-between;
+  align-items: center; margin-bottom: 10px;
+}
+.card-id {
+  font-family: "Courier New", monospace;
+  font-size: 13px; font-weight: bold;
+  color: var(--blue);
+}
+.relevance-badge {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: bold;
+}
+.relevance-badge.high   { color: var(--high); }
+.relevance-badge.medium { color: var(--medium); }
+.relevance-badge.low    { color: var(--low); }
+
+.score-bar {
+  width: 60px; height: 6px;
+  background: #e0d8cc; border-radius: 3px;
+  overflow: hidden; display: inline-block;
+}
+.score-bar span {
+  display: block; height: 100%; border-radius: 3px;
+  background: currentColor; transition: width 0.4s ease;
+}
+
+.card-meta {
+  display: flex; flex-wrap: wrap; gap: 12px;
+  font-size: 13px; color: var(--mid); margin-bottom: 10px;
+}
+.meta-label {
+  font-weight: bold; font-size: 11px;
+  letter-spacing: 0.5px; text-transform: uppercase;
+  margin-right: 3px; color: var(--blue);
+}
+
+.card-summary { font-size: 14px; line-height: 1.7; color: var(--ink); margin-bottom: 12px; }
+
+.card-topics { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.topic-tag {
+  background: #e8eef5; color: var(--blue);
+  border: 1px solid #c5d4e4; border-radius: 12px;
+  padding: 2px 10px; font-size: 11px;
+  font-family: Arial, sans-serif;
+}
+
+.card-footer { display: flex; justify-content: flex-end; }
+.viewer-link {
+  font-size: 13px; color: var(--blue); text-decoration: none;
+  font-weight: bold; border-bottom: 1px solid var(--blue);
+  padding-bottom: 1px; transition: color 0.15s;
+}
+.viewer-link:hover { color: var(--gold); border-color: var(--gold); }
+
+/* ── About note ──────────────────────────────────────────────────────────── */
+.about-note {
+  max-width: 900px; margin: 0 auto 0; padding: 0 40px 40px;
+  font-size: 12px; color: #aaa; font-style: italic;
+  border-top: 1px solid var(--border); padding-top: 20px; margin-top: 40px;
+}
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <div class="site-title">FirstPass — <span id="collection-name">Letter</span> Search</div>
+    <div class="site-subtitle">Semantic search across <span id="letter-count">…</span> — ask in plain English</div>
+  </div>
+</header>
+
+<div class="search-section">
+  <label class="search-label" for="query">What are you looking for?</label>
+  <div class="search-row">
+    <input type="text" id="query" disabled
+           placeholder="Loading search model…"
+           autocomplete="off" spellcheck="false">
+    <button id="search-btn" disabled>Search</button>
+  </div>
+  <div class="search-controls">
+    <span>Show top</span>
+    <label><input type="number" id="top-k" value="10" min="1" max="50"> results</label>
+    <span style="color: var(--border)">|</span>
+    <span>Results are ranked by conceptual relevance, not exact word match</span>
+  </div>
+</div>
+
+<div id="status" class="status loading-model">Loading search model…</div>
+
+<div class="hints" id="hints">
+  <span style="font-size:12px;color:var(--mid);align-self:center;">Try:</span>
+  <span class="hint-chip" onclick="setQuery(this)">loneliness and missing home</span>
+  <span class="hint-chip" onclick="setQuery(this)">fear of combat or death</span>
+  <span class="hint-chip" onclick="setQuery(this)">family news from home</span>
+  <span class="hint-chip" onclick="setQuery(this)">food and daily life in the military</span>
+  <span class="hint-chip" onclick="setQuery(this)">hoping the war will end soon</span>
+  <span class="hint-chip" onclick="setQuery(this)">promotions and military career</span>
+  <span class="hint-chip" onclick="setQuery(this)">relationships and romance</span>
+  <span class="hint-chip" onclick="setQuery(this)">money and financial concerns</span>
+</div>
+
+<div class="results-section">
+  <div id="result-count"></div>
+  <div id="results"></div>
+</div>
+
+<div class="about-note">
+  Powered by FirstPass — a local AI pipeline for archival document processing — by E.C. Thompson, UCF.
+  Search results are ranked by semantic similarity using sentence-transformers/all-MiniLM-L6-v2.
+  All AI-generated summaries require human verification before use in research or publication.
+</div>
+
+<script>
+// Hint chip helper — not a module, so defined outside
+function setQuery(el) {
+  document.getElementById("query").value = el.textContent;
+  document.getElementById("query").focus();
+}
+</script>
+
+</body>
+</html>
